@@ -13,6 +13,29 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// StringOrFloat64 支持字符串或数字类型的JSON字段解析
+type StringOrFloat64 float64
+
+func (s *StringOrFloat64) UnmarshalJSON(data []byte) error {
+	// 尝试解析成 float64
+	var f float64
+	if err := json.Unmarshal(data, &f); err == nil {
+		*s = StringOrFloat64(f)
+		return nil
+	}
+	// 尝试解析成字符串再转 float64
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+	f, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return err
+	}
+	*s = StringOrFloat64(f)
+	return nil
+}
+
 type WSClient struct {
 	conn *websocket.Conn
 	recv chan utils.KlineWithSymbol
@@ -49,7 +72,6 @@ func (w *WSClient) Stop() {
 	close(w.recv)
 }
 
-// 公开获取行情数据通道
 func (w *WSClient) Recv() <-chan utils.KlineWithSymbol {
 	return w.recv
 }
@@ -60,21 +82,16 @@ type rawStream struct {
 }
 
 type klineInner struct {
-	StartTime int64  `json:"t"` // 开盘时间
-	CloseTime int64  `json:"T"` // 收盘时间
-	Symbol    string `json:"s"`
-	Interval  string `json:"i"`
-	Open      string `json:"o"`
-	Close     string `json:"c"`
-	High      string `json:"h"`
-	Low       string `json:"l"`
-	Volume    string `json:"v"`
-	IsFinal   bool   `json:"x"`
-}
-
-func parseFloat(s string) float64 {
-	v, _ := strconv.ParseFloat(s, 64)
-	return v
+	StartTime int64           `json:"t"`
+	CloseTime int64           `json:"T"`
+	Symbol    string          `json:"s"`
+	Interval  string          `json:"i"`
+	Open      StringOrFloat64 `json:"o"`
+	Close     StringOrFloat64 `json:"c"`
+	High      StringOrFloat64 `json:"h"`
+	Low       StringOrFloat64 `json:"l"`
+	Volume    StringOrFloat64 `json:"v"`
+	IsFinal   bool            `json:"x"`
 }
 
 func (w *WSClient) readLoop() {
@@ -98,42 +115,33 @@ func (w *WSClient) readLoop() {
 		}
 
 		var inner struct {
-			E json.Number `json:"E"`
-			K klineInner  `json:"k"`
+			EvtType string     `json:"e"`
+			E       int64      `json:"E"`
+			K       klineInner `json:"k"`
 		}
 		if err := json.Unmarshal(rs.Data, &inner); err != nil {
 			log.Println("unmarshal inner err:", err)
 			continue
 		}
 
-		_, err = inner.E.Int64()
-		if err != nil {
-			log.Println("parse event time failed:", err)
+		if inner.EvtType != "kline" {
 			continue
 		}
 
 		k := inner.K
-		open := parseFloat(k.Open)
-		high := parseFloat(k.High)
-		low := parseFloat(k.Low)
-		closeP := parseFloat(k.Close)
-		vol := parseFloat(k.Volume)
-		sym := strings.ToUpper(k.Symbol)
-		interval := k.Interval
-
 		kline := utils.Kline{
 			Time:   time.UnixMilli(k.StartTime),
-			Open:   open,
-			High:   high,
-			Low:    low,
-			Close:  closeP,
-			Volume: vol,
+			Open:   float64(k.Open),
+			High:   float64(k.High),
+			Low:    float64(k.Low),
+			Close:  float64(k.Close),
+			Volume: float64(k.Volume),
 		}
 
 		select {
 		case w.recv <- utils.KlineWithSymbol{
-			Symbol:   sym,
-			Interval: interval,
+			Symbol:   strings.ToUpper(k.Symbol),
+			Interval: k.Interval,
 			Kline:    kline,
 		}:
 		case <-w.done:
