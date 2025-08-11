@@ -5,14 +5,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
 	"trader/data"
 	"trader/simulator"
+	"trader/strategy"
+	"trader/utils"
 )
 
 func main() {
 	account := simulator.NewAccount(1000)
-
 	wsURL := "wss://stream.binance.com:9443/stream?streams=" +
 		"btcusdt@kline_15m/btcusdt@kline_4h/" +
 		"ethusdt@kline_15m/ethusdt@kline_4h/" +
@@ -20,25 +20,29 @@ func main() {
 
 	client, err := data.NewWSClient(wsURL)
 	if err != nil {
-		log.Fatal("failed to connect ws:", err)
+		log.Fatal(err)
 	}
 	defer client.Stop()
-
 	client.Start()
+
+	// 策略实例，orderHandler为模拟下单回调
+	strat := strategy.NewSMAStrategy(5, func(symbol, side string, price float64) {
+		log.Printf("模拟下单: %s %s %.4f", symbol, side, price)
+		account.OnPriceUpdate(symbol, price)
+	})
 
 	go func() {
 		for kline := range client.Recv() {
-			// 示例调用账户更新价格
-			account.OnPriceUpdate(kline.Symbol, kline.Kline.Close)
-			// 这里可以接入你的策略信号处理逻辑
+			strat.OnNewKline(kline.Symbol, kline.Interval, utils.Kline{
+				Time:  kline.Kline.Time,
+				Close: kline.Kline.Close,
+			})
 		}
 	}()
 
-	// 等待系统信号优雅退出
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
-	log.Println("shutting down...")
 	account.Close()
 }
