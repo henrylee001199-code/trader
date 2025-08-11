@@ -5,11 +5,11 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/url"
-	"time"
+	"sync"
 	"trader/strategy"
 )
 
-// Binance WebSocket Kline事件结构体，字段价格、成交量用json.Number兼容数字或字符串
+// Binance WebSocket Kline事件结构体，价格等字段用json.Number兼容数字或字符串
 type KlineEvent struct {
 	EventType string    `json:"e"` // 事件类型
 	EventTime int64     `json:"E"` // 事件时间，毫秒
@@ -40,16 +40,31 @@ type KlineData struct {
 type WSClient struct {
 	conn   *websocket.Conn
 	stopCh chan struct{}
+
+	mu         sync.Mutex
+	strategies map[string]strategy.Strategy // 改成接口 Strategy
 }
 
+// NewWSClient 构造函数，初始化不同周期对应的复合策略
 func NewWSClient() *WSClient {
+	simpleMA15m := strategy.NewSimpleMA(5, 20)
+	rsi15m := strategy.NewRSIStrategy(14)
+	composite15m := strategy.NewCompositeStrategy(simpleMA15m, rsi15m)
+
+	simpleMA4h := strategy.NewSimpleMA(5, 20)
+	rsi4h := strategy.NewRSIStrategy(14)
+	composite4h := strategy.NewCompositeStrategy(simpleMA4h, rsi4h)
+
 	return &WSClient{
 		stopCh: make(chan struct{}),
+		strategies: map[string]strategy.Strategy{
+			"15m": composite15m,
+			"4h":  composite4h,
+		},
 	}
 }
 
 func (c *WSClient) Start() error {
-	// 示例订阅BTC/ETH/BNB 15m和4h K线
 	streams := "btcusdt@kline_15m/btcusdt@kline_4h/ethusdt@kline_15m/ethusdt@kline_4h/bnbusdt@kline_15m/bnbusdt@kline_4h"
 	u := url.URL{
 		Scheme:   "wss",
@@ -106,33 +121,6 @@ func (c *WSClient) handleMessage(msg []byte) {
 		return
 	}
 
-	// 打印示例：交易对、周期、收盘价、是否收盘
-	closePrice, _ := event.Kline.Close.Float64()
-	log.Printf("行情: %s %s 收盘价 %.4f %s %v", event.Symbol, event.Kline.Interval, closePrice, time.UnixMilli(event.Kline.CloseTime).Format(time.RFC3339), event.Kline.IsKlineClosed)
-}
-
-func (c *WSClient) Stop() {
-	close(c.stopCh)
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
-
-// 全局策略实例，举例15m和4h两个周期
-var (
-	simpleMA15m = strategy.NewSimpleMA(5, 20)
-	simpleMA4h  = strategy.NewSimpleMA(5, 20)
-)
-
-func handleMessage(msg []byte) {
-	var event KlineEvent
-	err := json.Unmarshal(msg, &event)
-	if err != nil {
-		log.Printf("json unmarshal error: %v", err)
-		return
-	}
-
-	// 转换收盘价字符串为float64
 	closePrice, err := event.Kline.Close.Float64()
 	if err != nil {
 		log.Printf("parse close price error: %v", err)
@@ -142,17 +130,32 @@ func handleMessage(msg []byte) {
 	log.Printf("行情: %s %s 收盘价 %.4f %v", event.Symbol, event.Kline.Interval, closePrice, event.Kline.IsKlineClosed)
 
 	if event.Kline.IsKlineClosed {
-		var signal string
-		switch event.Kline.Interval {
-		case "15m":
-			signal = simpleMA15m.OnNewPrice(closePrice)
-		case "4h":
-			signal = simpleMA4h.OnNewPrice(closePrice)
+		c.mu.Lock()
+		strat, ok := c.strategies[event.Kline.Interval]
+		c.mu.Unlock()
+
+		if !ok {
+			// 未知周期，忽略
+			return
 		}
 
+		signal := strat.OnNewPrice(closePrice)
 		if signal != "" {
 			log.Printf("策略信号：%s %s %s %.4f", event.Symbol, event.Kline.Interval, signal, closePrice)
-			// 这里可以接入模拟下单或实盘下单逻辑
+			// 这里扩展调用模拟或实盘下单
+			c.simulateOrder(event.Symbol, signal, closePrice)
 		}
+	}
+}
+
+func (c *WSClient) simulateOrder(symbol, action string, price float64) {
+	log.Printf("模拟下单: %s %s %.4f", symbol, action, price)
+	// TODO: 这里可以调用真实下单接口或其它逻辑
+}
+
+func (c *WSClient) Stop() {
+	close(c.stopCh)
+	if c.conn != nil {
+		c.conn.Close()
 	}
 }
