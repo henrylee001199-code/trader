@@ -1,136 +1,158 @@
 package data
 
 import (
-	"context"
 	"encoding/json"
+	"github.com/gorilla/websocket"
 	"log"
 	"net/url"
-	"strings"
-	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
-	"trader/utils"
+	"trader/strategy"
 )
 
+// Binance WebSocket Kline事件结构体，字段价格、成交量用json.Number兼容数字或字符串
+type KlineEvent struct {
+	EventType string    `json:"e"` // 事件类型
+	EventTime int64     `json:"E"` // 事件时间，毫秒
+	Symbol    string    `json:"s"` // 交易对
+	Kline     KlineData `json:"k"` // K线详细数据
+}
+
+type KlineData struct {
+	StartTime           int64       `json:"t"`
+	CloseTime           int64       `json:"T"`
+	Symbol              string      `json:"s"`
+	Interval            string      `json:"i"`
+	FirstTradeID        int64       `json:"f"`
+	LastTradeID         int64       `json:"L"`
+	Open                json.Number `json:"o"`
+	Close               json.Number `json:"c"`
+	High                json.Number `json:"h"`
+	Low                 json.Number `json:"l"`
+	Volume              json.Number `json:"v"`
+	NumberOfTrades      int64       `json:"n"`
+	IsKlineClosed       bool        `json:"x"`
+	QuoteVolume         json.Number `json:"q"`
+	TakerBuyBaseVolume  json.Number `json:"V"`
+	TakerBuyQuoteVolume json.Number `json:"Q"`
+	Ignore              string      `json:"B"`
+}
+
 type WSClient struct {
-	conn      *websocket.Conn
-	ctx       context.Context
-	cancel    context.CancelFunc
-	klineCh   chan KlineWithSymbol
-	wg        sync.WaitGroup
-	symbols   []string
-	intervals []string
+	conn   *websocket.Conn
+	stopCh chan struct{}
 }
 
-// KlineWithSymbol 封装行情数据和标识
-type KlineWithSymbol struct {
-	Symbol   string
-	Interval string
-	Kline    utils.Kline
-}
-
-// NewWSClient 创建新的WebSocket客户端
-func NewWSClient(symbols []string, intervals []string) *WSClient {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewWSClient() *WSClient {
 	return &WSClient{
-		ctx:       ctx,
-		cancel:    cancel,
-		klineCh:   make(chan KlineWithSymbol, 100),
-		symbols:   symbols,
-		intervals: intervals,
+		stopCh: make(chan struct{}),
 	}
 }
 
-// Start 建立连接并开始接收数据
 func (c *WSClient) Start() error {
-	streams := []string{}
-	for _, sym := range c.symbols {
-		for _, interval := range c.intervals {
-			streams = append(streams, strings.ToLower(sym)+"@kline_"+interval)
-		}
-	}
-
+	// 示例订阅BTC/ETH/BNB 15m和4h K线
+	streams := "btcusdt@kline_15m/btcusdt@kline_4h/ethusdt@kline_15m/ethusdt@kline_4h/bnbusdt@kline_15m/bnbusdt@kline_4h"
 	u := url.URL{
 		Scheme:   "wss",
 		Host:     "stream.binance.com:9443",
 		Path:     "/stream",
-		RawQuery: "streams=" + strings.Join(streams, "/"),
+		RawQuery: "streams=" + streams,
 	}
 
-	log.Println("connecting to", u.String())
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	var err error
+	c.conn, _, err = websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return err
 	}
-	c.conn = conn
+	log.Printf("connected to %s", u.String())
 
-	c.wg.Add(1)
 	go c.readLoop()
-
 	return nil
 }
 
 func (c *WSClient) readLoop() {
-	defer c.wg.Done()
+	defer c.conn.Close()
 
 	for {
 		select {
-		case <-c.ctx.Done():
-			log.Println("ws read loop exiting")
+		case <-c.stopCh:
 			return
 		default:
-		}
+			_, msg, err := c.conn.ReadMessage()
+			if err != nil {
+				log.Printf("read error: %v", err)
+				return
+			}
 
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			log.Println("read error:", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		var resp struct {
-			Data struct {
-				E string          `json:"e"`
-				S string          `json:"s"`
-				K json.RawMessage `json:"k"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(message, &resp); err != nil {
-			log.Println("json unmarshal error:", err)
-			continue
-		}
-
-		if resp.Data.E != "kline" {
-			continue
-		}
-
-		var k utils.Kline
-		if err := json.Unmarshal(resp.Data.K, &k); err != nil {
-			log.Println("kline unmarshal error:", err)
-			continue
-		}
-
-		c.klineCh <- KlineWithSymbol{
-			Symbol:   resp.Data.S,
-			Interval: k.Interval,
-			Kline:    k,
+			c.handleMessage(msg)
 		}
 	}
 }
 
-// Recv 返回行情数据通道，供外部消费
-func (c *WSClient) Recv() <-chan KlineWithSymbol {
-	return c.klineCh
+func (c *WSClient) handleMessage(msg []byte) {
+	// 外层结构 Binance WebSocket推送格式： { "stream": "...", "data": { ... } }
+	var wrapper struct {
+		Stream string          `json:"stream"`
+		Data   json.RawMessage `json:"data"`
+	}
+
+	if err := json.Unmarshal(msg, &wrapper); err != nil {
+		log.Printf("json unmarshal wrapper error: %v", err)
+		return
+	}
+
+	var event KlineEvent
+	if err := json.Unmarshal(wrapper.Data, &event); err != nil {
+		log.Printf("json unmarshal inner error: %v", err)
+		return
+	}
+
+	// 打印示例：交易对、周期、收盘价、是否收盘
+	closePrice, _ := event.Kline.Close.Float64()
+	log.Printf("行情: %s %s 收盘价 %.4f %s %v", event.Symbol, event.Kline.Interval, closePrice, time.UnixMilli(event.Kline.CloseTime).Format(time.RFC3339), event.Kline.IsKlineClosed)
 }
 
-// Stop 关闭连接并退出
 func (c *WSClient) Stop() {
-	c.cancel()
+	close(c.stopCh)
 	if c.conn != nil {
 		c.conn.Close()
 	}
-	c.wg.Wait()
-	close(c.klineCh)
+}
+
+// 全局策略实例，举例15m和4h两个周期
+var (
+	simpleMA15m = strategy.NewSimpleMA(5, 20)
+	simpleMA4h  = strategy.NewSimpleMA(5, 20)
+)
+
+func handleMessage(msg []byte) {
+	var event KlineEvent
+	err := json.Unmarshal(msg, &event)
+	if err != nil {
+		log.Printf("json unmarshal error: %v", err)
+		return
+	}
+
+	// 转换收盘价字符串为float64
+	closePrice, err := event.Kline.Close.Float64()
+	if err != nil {
+		log.Printf("parse close price error: %v", err)
+		return
+	}
+
+	log.Printf("行情: %s %s 收盘价 %.4f %v", event.Symbol, event.Kline.Interval, closePrice, event.Kline.IsKlineClosed)
+
+	if event.Kline.IsKlineClosed {
+		var signal string
+		switch event.Kline.Interval {
+		case "15m":
+			signal = simpleMA15m.OnNewPrice(closePrice)
+		case "4h":
+			signal = simpleMA4h.OnNewPrice(closePrice)
+		}
+
+		if signal != "" {
+			log.Printf("策略信号：%s %s %s %.4f", event.Symbol, event.Kline.Interval, signal, closePrice)
+			// 这里可以接入模拟下单或实盘下单逻辑
+		}
+	}
 }
