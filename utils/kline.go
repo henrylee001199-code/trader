@@ -1,20 +1,20 @@
 package utils
 
-import "time"
-
-// Kline 是单根K线数据结构
 type Kline struct {
-	Time   time.Time
-	Open   float64
-	High   float64
-	Low    float64
-	Close  float64
-	Volume float64
-}
-
-// KlineWithSymbol 带币种和周期的K线，用于跨包传递
-type KlineWithSymbol struct {
-	Symbol   string
-	Interval string
-	Kline    Kline
+	StartTime      int64   `json:"t"`
+	CloseTime      int64   `json:"T"`
+	Symbol         string  `json:"-"` // 这个字段自己赋值，JSON里没有
+	Interval       string  `json:"i"`
+	FirstTradeID   int64   `json:"f"`
+	LastTradeID    int64   `json:"L"`
+	Open           float64 `json:"o,string"`
+	Close          float64 `json:"c,string"`
+	High           float64 `json:"h,string"`
+	Low            float64 `json:"l,string"`
+	Volume         float64 `json:"v,string"`
+	Trades         int64   `json:"n"`
+	IsClosed       bool    `json:"x"`
+	QuoteVolume    float64 `json:"q,string"`
+	BuyVolume      float64 `json:"V,string"`
+	BuyQuoteVolume float64 `json:"Q,string"`
 }

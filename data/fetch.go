@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"trader/utils"
 )
@@ -41,13 +40,14 @@ func FetchKlines(symbol, interval string, limit int) ([]utils.Kline, error) {
 			openTime = v
 		}
 		klines = append(klines, utils.Kline{
-			Time:   time.UnixMilli(openTime),
-			Open:   open,
-			High:   high,
-			Low:    low,
-			Close:  closeP,
-			Volume: volume,
+			StartTime: openTime, // 毫秒时间戳，int64
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     closeP,
+			Volume:    volume,
 		})
 	}
+
 	return klines, nil
 }

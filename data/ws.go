@@ -1,151 +1,136 @@
 package data
 
 import (
+	"context"
 	"encoding/json"
 	"log"
-	"strconv"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"trader/utils"
-
 	"github.com/gorilla/websocket"
+	"trader/utils"
 )
 
-// StringOrFloat64 支持字符串或数字类型的JSON字段解析
-type StringOrFloat64 float64
+type WSClient struct {
+	conn      *websocket.Conn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	klineCh   chan KlineWithSymbol
+	wg        sync.WaitGroup
+	symbols   []string
+	intervals []string
+}
 
-func (s *StringOrFloat64) UnmarshalJSON(data []byte) error {
-	// 尝试解析成 float64
-	var f float64
-	if err := json.Unmarshal(data, &f); err == nil {
-		*s = StringOrFloat64(f)
-		return nil
+// KlineWithSymbol 封装行情数据和标识
+type KlineWithSymbol struct {
+	Symbol   string
+	Interval string
+	Kline    utils.Kline
+}
+
+// NewWSClient 创建新的WebSocket客户端
+func NewWSClient(symbols []string, intervals []string) *WSClient {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &WSClient{
+		ctx:       ctx,
+		cancel:    cancel,
+		klineCh:   make(chan KlineWithSymbol, 100),
+		symbols:   symbols,
+		intervals: intervals,
 	}
-	// 尝试解析成字符串再转 float64
-	var str string
-	if err := json.Unmarshal(data, &str); err != nil {
-		return err
+}
+
+// Start 建立连接并开始接收数据
+func (c *WSClient) Start() error {
+	streams := []string{}
+	for _, sym := range c.symbols {
+		for _, interval := range c.intervals {
+			streams = append(streams, strings.ToLower(sym)+"@kline_"+interval)
+		}
 	}
-	f, err := strconv.ParseFloat(str, 64)
+
+	u := url.URL{
+		Scheme:   "wss",
+		Host:     "stream.binance.com:9443",
+		Path:     "/stream",
+		RawQuery: "streams=" + strings.Join(streams, "/"),
+	}
+
+	log.Println("connecting to", u.String())
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return err
 	}
-	*s = StringOrFloat64(f)
+	c.conn = conn
+
+	c.wg.Add(1)
+	go c.readLoop()
+
 	return nil
 }
 
-type WSClient struct {
-	conn *websocket.Conn
-	recv chan utils.KlineWithSymbol
+func (c *WSClient) readLoop() {
+	defer c.wg.Done()
 
-	done chan struct{}
-	wg   sync.WaitGroup
-}
-
-func NewWSClient(url string) (*WSClient, error) {
-	c, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := &WSClient{
-		conn: c,
-		recv: make(chan utils.KlineWithSymbol, 100),
-		done: make(chan struct{}),
-	}
-	return client, nil
-}
-
-func (w *WSClient) Start() {
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
-		w.readLoop()
-	}()
-}
-
-func (w *WSClient) Stop() {
-	close(w.done)
-	_ = w.conn.Close()
-	w.wg.Wait()
-	close(w.recv)
-}
-
-func (w *WSClient) Recv() <-chan utils.KlineWithSymbol {
-	return w.recv
-}
-
-type rawStream struct {
-	Stream string          `json:"stream"`
-	Data   json.RawMessage `json:"data"`
-}
-
-type klineInner struct {
-	StartTime int64           `json:"t"`
-	CloseTime int64           `json:"T"`
-	Symbol    string          `json:"s"`
-	Interval  string          `json:"i"`
-	Open      StringOrFloat64 `json:"o"`
-	Close     StringOrFloat64 `json:"c"`
-	High      StringOrFloat64 `json:"h"`
-	Low       StringOrFloat64 `json:"l"`
-	Volume    StringOrFloat64 `json:"v"`
-	IsFinal   bool            `json:"x"`
-}
-
-func (w *WSClient) readLoop() {
 	for {
 		select {
-		case <-w.done:
+		case <-c.ctx.Done():
+			log.Println("ws read loop exiting")
 			return
 		default:
 		}
 
-		_, msg, err := w.conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Println("read websocket message err:", err)
-			return
-		}
-
-		var rs rawStream
-		if err := json.Unmarshal(msg, &rs); err != nil {
-			log.Println("unmarshal raw err:", err)
+			log.Println("read error:", err)
+			time.Sleep(time.Second)
 			continue
 		}
 
-		var inner struct {
-			EvtType string     `json:"e"`
-			E       int64      `json:"E"`
-			K       klineInner `json:"k"`
+		var resp struct {
+			Data struct {
+				E string          `json:"e"`
+				S string          `json:"s"`
+				K json.RawMessage `json:"k"`
+			} `json:"data"`
 		}
-		if err := json.Unmarshal(rs.Data, &inner); err != nil {
-			log.Println("unmarshal inner err:", err)
+
+		if err := json.Unmarshal(message, &resp); err != nil {
+			log.Println("json unmarshal error:", err)
 			continue
 		}
 
-		if inner.EvtType != "kline" {
+		if resp.Data.E != "kline" {
 			continue
 		}
 
-		k := inner.K
-		kline := utils.Kline{
-			Time:   time.UnixMilli(k.StartTime),
-			Open:   float64(k.Open),
-			High:   float64(k.High),
-			Low:    float64(k.Low),
-			Close:  float64(k.Close),
-			Volume: float64(k.Volume),
+		var k utils.Kline
+		if err := json.Unmarshal(resp.Data.K, &k); err != nil {
+			log.Println("kline unmarshal error:", err)
+			continue
 		}
 
-		select {
-		case w.recv <- utils.KlineWithSymbol{
-			Symbol:   strings.ToUpper(k.Symbol),
+		c.klineCh <- KlineWithSymbol{
+			Symbol:   resp.Data.S,
 			Interval: k.Interval,
-			Kline:    kline,
-		}:
-		case <-w.done:
-			return
+			Kline:    k,
 		}
 	}
+}
+
+// Recv 返回行情数据通道，供外部消费
+func (c *WSClient) Recv() <-chan KlineWithSymbol {
+	return c.klineCh
+}
+
+// Stop 关闭连接并退出
+func (c *WSClient) Stop() {
+	c.cancel()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.wg.Wait()
+	close(c.klineCh)
 }

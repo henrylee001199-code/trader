@@ -5,44 +5,33 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
 	"trader/data"
-	"trader/simulator"
-	"trader/strategy"
-	"trader/utils"
 )
 
 func main() {
-	account := simulator.NewAccount(1000)
-	wsURL := "wss://stream.binance.com:9443/stream?streams=" +
-		"btcusdt@kline_15m/btcusdt@kline_4h/" +
-		"ethusdt@kline_15m/ethusdt@kline_4h/" +
-		"bnbusdt@kline_15m/bnbusdt@kline_4h"
+	symbols := []string{"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+	intervals := []string{"15m", "4h"}
 
-	client, err := data.NewWSClient(wsURL)
+	client := data.NewWSClient(symbols, intervals)
+	err := client.Start()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("ws start err:", err)
 	}
-	defer client.Stop()
-	client.Start()
 
-	// 策略实例，orderHandler为模拟下单回调
-	strat := strategy.NewSMAStrategy(5, func(symbol, side string, price float64) {
-		log.Printf("模拟下单: %s %s %.4f", symbol, side, price)
-		account.OnPriceUpdate(symbol, price)
-	})
-
+	// 在策略里调用
 	go func() {
-		for kline := range client.Recv() {
-			strat.OnNewKline(kline.Symbol, kline.Interval, utils.Kline{
-				Time:  kline.Kline.Time,
-				Close: kline.Kline.Close,
-			})
+		for k := range client.Recv() {
+			log.Printf("行情: %s %s 收盘价 %.4f", k.Symbol, k.Interval, k.Kline.Close)
+			// strat.OnNewKline(k.Symbol, k.Interval, k.Kline)
 		}
 	}()
 
+	// 等待退出信号
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
-	account.Close()
+	client.Stop()
+	log.Println("程序退出")
 }
